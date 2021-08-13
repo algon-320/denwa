@@ -46,9 +46,24 @@ impl PulseSimpleExt for simple_pulse::Simple {
 
 #[derive(Debug)]
 struct Config {
-    audio_ch: u8,
-    audio_rate: u32,
-    buf_size: usize,
+    channels: opus::Channels,
+    sampling_rate: u32,
+    frame_length: u32,
+}
+
+impl Config {
+    fn ch_num(&self) -> u8 {
+        match self.channels {
+            opus::Channels::Mono => 1,
+            opus::Channels::Stereo => 2,
+        }
+    }
+
+    fn samples_per_frame(&self) -> usize {
+        let ch = self.ch_num() as usize;
+        let samples = (self.sampling_rate * self.frame_length / 1000) as usize;
+        ch * samples
+    }
 }
 
 fn spawn_command_thread(
@@ -120,8 +135,8 @@ fn spawn_pulseaudio_input_thread(
 ) {
     let spec = Spec {
         format: Format::S16NE,
-        channels: config.audio_ch,
-        rate: config.audio_rate,
+        channels: config.ch_num(),
+        rate: config.sampling_rate,
     };
     assert!(spec.is_valid());
 
@@ -139,15 +154,12 @@ fn spawn_pulseaudio_input_thread(
 
     spawn(move || {
         || -> Result<(), Error> {
-            let ch = match config.audio_ch {
-                1 => opus::Channels::Mono,
-                2 => opus::Channels::Stereo,
-                _ => panic!("unsupported channel"),
-            };
-            let mut opus = opus::Encoder::new(spec.rate, ch, opus::Application::Voip).unwrap();
+            let mut opus =
+                opus::Encoder::new(spec.rate, config.channels, opus::Application::Voip).unwrap();
 
-            let mut buf = vec![0i16; config.buf_size / 2];
-            let mut encoded = vec![0; config.buf_size];
+            let bufsize = config.samples_per_frame();
+            let mut buf = vec![0i16; bufsize];
+            let mut encoded = vec![0; bufsize * 2];
 
             loop {
                 pulse_record.read16(&mut buf).unwrap();
@@ -206,8 +218,8 @@ fn voice_chat(
 
     let spec = Spec {
         format: Format::S16NE,
-        channels: config.audio_ch,
-        rate: config.audio_rate,
+        channels: config.ch_num(),
+        rate: config.sampling_rate,
     };
     assert!(spec.is_valid());
 
@@ -236,13 +248,8 @@ fn voice_chat(
     )
     .unwrap_or_else(|e| panic!("pulseaudio error: {:?}", e.to_string()));
 
-    let ch = match config.audio_ch {
-        1 => opus::Channels::Mono,
-        2 => opus::Channels::Stereo,
-        _ => panic!("unsupported channel"),
-    };
-    let mut opus = opus::Decoder::new(spec.rate, ch).unwrap();
-    let mut buf = vec![0i16; config.buf_size / 2];
+    let mut opus = opus::Decoder::new(spec.rate, config.channels).unwrap();
+    let mut buf = vec![0i16; config.samples_per_frame()];
 
     'process_message: loop {
         let (enc_msg, src) = match recv_from::<Sealed<Message>>(&sock) {
@@ -306,13 +313,18 @@ fn start(matches: clap::ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
     use clap::value_t;
 
     let config = {
-        let audio_ch = value_t!(matches, "audio-ch", u8).unwrap();
+        let audio_ch = matches.value_of("audio-ch").unwrap();
+        let channels = match audio_ch {
+            "mono" => opus::Channels::Mono,
+            "stereo" => opus::Channels::Stereo,
+            _ => unreachable!(),
+        };
         let audio_rate = value_t!(matches, "audio-rate", u32).unwrap();
-        let buf_size = value_t!(matches, "buffer-size", usize).unwrap();
+        let frame_length = value_t!(matches, "frame-length", u32).unwrap();
         Config {
-            audio_ch,
-            audio_rate,
-            buf_size,
+            channels,
+            sampling_rate: audio_rate,
+            frame_length,
         }
     };
 
@@ -445,21 +457,24 @@ fn main() {
             Arg::with_name("audio-ch")
                 .long("ch")
                 .takes_value(true)
-                .possible_values(&["1", "2"])
-                .default_value("1"),
+                .possible_values(&["mono", "stereo"])
+                .default_value("mono"),
         )
         .arg(
             Arg::with_name("audio-rate")
                 .long("rate")
                 .takes_value(true)
-                .possible_values(&["12000", "24000", "48000"])
+                .help("Sampling rate")
+                .possible_values(&["8000", "12000", "16000", "24000", "48000"])
                 .default_value("24000"),
         )
         .arg(
-            Arg::with_name("buffer-size")
-                .long("bufsize")
+            Arg::with_name("frame-length")
+                .long("frame-length")
                 .takes_value(true)
-                .default_value("960"),
+                .help("Opus frame length in milliseconds")
+                .possible_values(&["2.5", "5", "10", "20", "40", "60"])
+                .default_value("20"),
         )
         .get_matches();
 

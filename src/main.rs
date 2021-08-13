@@ -1,22 +1,22 @@
 mod traffic_meter;
 
-use log::{debug, error, info};
-use rand::Rng;
 use std::io::prelude::*;
+use std::io::{stdin, stdout};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread::{sleep, spawn};
 use std::time::Duration;
 
-use pulse::sample::{Format, Spec};
-use pulse::stream::Direction;
-use simple_pulse::Simple;
-
+use log::{debug, error, info};
 use p2p_handshake::{
     client::get_peer_addr,
     crypto::{Sealed, SymmetricKey},
     error::{Error, Result},
     message::{recv_from, send_to},
+};
+use pulse::{
+    sample::{Format, Spec},
+    stream::Direction,
 };
 
 use traffic_meter::TrafficMeter;
@@ -41,16 +41,15 @@ fn spawn_command_thread(
     peer_addr: SocketAddr,
     traffic: Arc<TrafficMeter>,
 ) {
-    println!("peer-to-peer voice chat example");
     println!("['?' to show available commands]");
     spawn(move || {
         || -> Result<()> {
             loop {
                 print!("command >>> ");
-                std::io::stdout().flush().unwrap();
+                stdout().flush().unwrap();
 
                 let mut buffer = String::new();
-                std::io::stdin().read_line(&mut buffer)?;
+                stdin().read_line(&mut buffer)?;
 
                 match buffer.as_str().trim() {
                     "" => {
@@ -110,9 +109,9 @@ fn spawn_pulseaudio_input_thread(
     };
     assert!(spec.is_valid());
 
-    let record = Simple::new(
+    let record = simple_pulse::Simple::new(
         None,              // Use the default server
-        "p2p-voice-chat",  // Our application’s name
+        "denwa",           // Our application’s name
         Direction::Record, // We want a record stream
         None,              // Use the default device
         "recording",       // Description of our stream
@@ -218,9 +217,9 @@ fn voice_chat(
     );
     spawn_heartbeat_thread(sock.clone(), key.clone(), peer_addr);
 
-    let output = Simple::new(
+    let output = simple_pulse::Simple::new(
         None,                // Use the default server
-        "p2p-voice-chat",    // Our application’s name
+        "denwa",             // Our application’s name
         Direction::Playback, // We want a playback stream
         None,                // Use the default device
         "output",            // Description of our stream
@@ -294,50 +293,27 @@ fn voice_chat(
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-enum AppError {
-    #[error("invalid argument: {}", .0)]
-    InvalidArg(String),
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct InvitationToken {
+    addr: SocketAddr,
+    psk: Vec<u8>,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct InvitationToken(SocketAddr, Vec<u8>);
+fn random_psk(len: usize) -> Vec<u8> {
+    use rand::{thread_rng, Rng};
+    let mut key = vec![0u8; len];
+    let mut rng = thread_rng();
+    rng.fill(key.as_mut_slice());
+    key
+}
 
 fn start(matches: clap::ArgMatches) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let local_port = matches
-        .value_of("local-port")
-        .unwrap_or("0")
-        .parse::<u16>()
-        .map_err(|e| AppError::InvalidArg(format!("invalid <local-port>: {}", e)))?;
-
-    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, local_port))?;
-    info!("socket port = {}", sock.local_addr().unwrap().port());
+    use clap::value_t;
 
     let config = {
-        let audio_ch = matches
-            .value_of("audio-ch")
-            .unwrap_or("1")
-            .parse::<u8>()
-            .map_err(|e| AppError::InvalidArg(format!("invalid <audio-ch>: {}", e)))?;
-        if !(audio_ch == 1 || audio_ch == 2) {
-            return Err(AppError::InvalidArg("<audio-ch> must be 1 or 2".into()).into());
-        }
-
-        let audio_rate = matches
-            .value_of("audio-rate")
-            .unwrap_or("24000")
-            .parse::<u32>()
-            .map_err(|e| AppError::InvalidArg(format!("invalid <audio-rate>: {}", e)))?;
-
-        let buf_size = matches
-            .value_of("buffer-size")
-            .unwrap_or("960")
-            .parse::<usize>()
-            .map_err(|e| AppError::InvalidArg(format!("invalid <buffer-size>: {}", e)))?;
-        if buf_size % 2 != 0 {
-            return Err(AppError::InvalidArg("<buffer-size> must be multiple of 2".into()).into());
-        }
-
+        let audio_ch = value_t!(matches, "audio-ch", u8).unwrap();
+        let audio_rate = value_t!(matches, "audio-rate", u32).unwrap();
+        let buf_size = value_t!(matches, "buffer-size", usize).unwrap();
         Config {
             audio_ch,
             audio_rate,
@@ -345,68 +321,76 @@ fn start(matches: clap::ArgMatches) -> std::result::Result<(), Box<dyn std::erro
         }
     };
 
-    let psk;
-    let (my_addr, peer_addr) = match matches.subcommand() {
-        ("manual", Some(matches)) | ("invite", Some(matches)) => {
+    match matches.subcommand() {
+        ("wait", Some(matches)) => {
+            let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+            info!("socket local address = {:?}", sock.local_addr().unwrap());
+
             let addr = matches.value_of("server-address").expect("required arg");
-            let port = matches.value_of("server-port").expect("required arg");
-            let port = port
-                .parse::<u16>()
-                .map_err(|e| AppError::InvalidArg(format!("invalid <server-port>: {}", e)))?;
+            let port = value_t!(matches, "server-port", u16).expect("required arg");
             let server_sockaddr = (addr, port).to_socket_addrs()?.next().unwrap();
 
-            psk = matches
+            let psk = matches
                 .value_of("preshared-key")
                 .map(|psk| psk.as_bytes().to_vec())
-                .unwrap_or_else(|| {
-                    let mut key = vec![0u8; 8];
-                    let mut rng = rand::thread_rng();
-                    rng.fill(key.as_mut_slice());
-                    key
-                });
+                .unwrap_or_else(|| random_psk(8));
 
-            let token = InvitationToken(server_sockaddr, psk.clone());
+            let token = InvitationToken {
+                addr: server_sockaddr,
+                psk: psk.clone(),
+            };
             let token_bytes = serde_cbor::to_vec(&token)?;
             println!("invitation-token: {}", base64::encode(&token_bytes));
 
-            get_peer_addr(&sock, server_sockaddr, &psk)?
+            let (my_addr, peer_addr) = get_peer_addr(&sock, server_sockaddr, &psk)?;
+            voice_chat(sock, my_addr, peer_addr, &psk, config)?;
+            Ok(())
         }
 
         ("join", Some(matches)) => {
+            let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+            info!("socket local address = {:?}", sock.local_addr().unwrap());
+
             let token = matches.value_of("invitation-token").expect("required arg");
             let token_bytes = base64::decode(token)?;
             let token: InvitationToken = serde_cbor::from_slice(&token_bytes)?;
-            psk = token.1;
-            get_peer_addr(&sock, token.0, &psk)?
+            let (my_addr, peer_addr) = get_peer_addr(&sock, token.addr, &token.psk)?;
+
+            voice_chat(sock, my_addr, peer_addr, &token.psk, config)?;
+            Ok(())
         }
 
         ("lan", Some(matches)) => {
+            let local_port = value_t!(matches, "local-port", u16).unwrap_or(0);
+            let bind_addr = value_t!(matches, "bind-address", Ipv4Addr).unwrap();
+            let sock = UdpSocket::bind((bind_addr, local_port))?;
+            info!("socket local address = {:?}", sock.local_addr().unwrap());
+
             println!("Specify peer's address and port number (e.g. 127.0.0.1:10001)");
             print!("address:port > ");
-            std::io::stdout().flush()?;
+            stdout().flush()?;
 
-            let mut peer_addr = String::new();
-            std::io::stdin().read_line(&mut peer_addr)?;
-            let peer_addr = peer_addr.trim().to_socket_addrs()?.next().unwrap();
+            let psk = matches
+                .value_of("preshared-key")
+                .map(|psk| psk.as_bytes().to_vec())
+                .unwrap_or_else(|| random_psk(8));
+
+            let peer_addr = {
+                let mut peer_addr = String::new();
+                stdin().read_line(&mut peer_addr)?;
+                peer_addr.trim().to_socket_addrs()?.next().unwrap()
+            };
+
+            // FIXME: use of 0.0.0.0 will lead to insecure channel
             let my_addr = sock.local_addr()?;
 
-            psk = matches
-                .value_of("preshared-key")
-                .expect("required arg")
-                .as_bytes()
-                .to_vec();
+            voice_chat(sock, my_addr, peer_addr, &psk, config)?;
 
-            (my_addr, peer_addr)
+            Ok(())
         }
 
-        (cmd, _) => {
-            return Err(AppError::InvalidArg(format!("unknown subcommand {:?}", cmd)).into())
-        }
-    };
-
-    // start voice chating
-    voice_chat(sock, my_addr, peer_addr, &psk, config)?;
-    Ok(())
+        (cmd, _) => Err(format!("unknown subcommand {:?}", cmd).into()),
+    }
 }
 
 fn main() {
@@ -417,7 +401,7 @@ fn main() {
         .version(env!("CARGO_PKG_VERSION"))
         .author("algon-320 <algon.0320@mail.com>")
         .subcommand(
-            SubCommand::with_name("manual")
+            SubCommand::with_name("wait")
                 .arg(
                     Arg::with_name("server-address")
                         .takes_value(true)
@@ -430,21 +414,8 @@ fn main() {
                 )
                 .arg(
                     Arg::with_name("preshared-key")
-                        .takes_value(true)
-                        .required(true),
-                ),
-        )
-        .subcommand(
-            SubCommand::with_name("invite")
-                .arg(
-                    Arg::with_name("server-address")
-                        .takes_value(true)
-                        .required(true),
-                )
-                .arg(
-                    Arg::with_name("server-port")
-                        .takes_value(true)
-                        .required(true),
+                        .long("psk")
+                        .takes_value(true),
                 ),
         )
         .subcommand(
@@ -455,35 +426,45 @@ fn main() {
             ),
         )
         .subcommand(
-            SubCommand::with_name("lan").arg(
-                Arg::with_name("preshared-key")
-                    .takes_value(true)
-                    .required(true),
-            ),
+            SubCommand::with_name("lan")
+                .arg(
+                    Arg::with_name("bind-address")
+                        .long("bind-address")
+                        .short("a")
+                        .takes_value(true)
+                        .default_value("127.0.0.1"),
+                )
+                .arg(
+                    Arg::with_name("local-port")
+                        .long("local-port")
+                        .short("p")
+                        .takes_value(true),
+                )
+                .arg(
+                    Arg::with_name("preshared-key")
+                        .long("psk")
+                        .takes_value(true),
+                ),
         )
         .arg(
             Arg::with_name("audio-ch")
                 .long("ch")
                 .takes_value(true)
-                .required(false),
+                .possible_values(&["1", "2"])
+                .default_value("1"),
         )
         .arg(
             Arg::with_name("audio-rate")
                 .long("rate")
                 .takes_value(true)
-                .required(false),
+                .possible_values(&["12000", "24000", "48000"])
+                .default_value("24000"),
         )
         .arg(
             Arg::with_name("buffer-size")
                 .long("bufsize")
                 .takes_value(true)
-                .required(false),
-        )
-        .arg(
-            Arg::with_name("local-port")
-                .long("local-port")
-                .takes_value(true)
-                .required(false),
+                .default_value("960"),
         )
         .get_matches();
 

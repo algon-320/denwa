@@ -1,0 +1,20 @@
+[package]
+name = "denwa"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+p2p-handshake = { git = "https://github.com/algon-320/p2p-handshake", branch = "main" }
+log = "0.4.14"
+thiserror = "1.0"
+env_logger = "0.9.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11.1"
+clap = "2.33.3"
+pulse = { version = "2.0", package = "libpulse-binding" }
+simple_pulse = { version = "2.0", package = "libpulse-simple-binding" }
+opus = "0.2.1"
+rand = "0.8.4"
+base64 = "0.13.0"

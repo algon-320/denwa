@@ -11,7 +11,7 @@ use log::{debug, error, info};
 use p2p_handshake::{
     client::get_peer_addr,
     crypto::{Sealed, SymmetricKey},
-    error::{Error, Result},
+    error::Error,
     message::{recv_from, send_to},
 };
 use pulse::{
@@ -26,6 +26,22 @@ enum Message {
     Heartbeat,
     Text(String),
     Opus(Vec<u8>),
+}
+
+use pulse::error::PAErr;
+trait PulseSimpleExt {
+    fn read16(&self, buf: &mut [i16]) -> Result<(), PAErr>;
+    fn write16(&self, buf: &[i16]) -> Result<(), PAErr>;
+}
+impl PulseSimpleExt for simple_pulse::Simple {
+    fn read16(&self, buf: &mut [i16]) -> Result<(), PAErr> {
+        let (_, buf, _) = unsafe { buf.align_to_mut::<u8>() };
+        self.read(buf)
+    }
+    fn write16(&self, buf: &[i16]) -> Result<(), PAErr> {
+        let (_, buf, _) = unsafe { buf.align_to::<u8>() };
+        self.write(buf)
+    }
 }
 
 #[derive(Debug)]
@@ -43,7 +59,7 @@ fn spawn_command_thread(
 ) {
     println!("['?' to show available commands]");
     spawn(move || {
-        || -> Result<()> {
+        || -> Result<(), Error> {
             loop {
                 print!("command >>> ");
                 stdout().flush().unwrap();
@@ -81,8 +97,8 @@ fn spawn_command_thread(
                     }
                     cmd if cmd.starts_with("text ") => {
                         let text = cmd.strip_prefix("text ").unwrap();
-                        let mut key = key.lock().unwrap();
-                        let enc_msg = key.encrypt(Message::Text(text.into()))?;
+                        let msg = Message::Text(text.into());
+                        let enc_msg = key.lock().unwrap().encrypt(msg)?;
                         send_to(enc_msg, &sock, peer_addr)?;
                     }
                     cmd => {
@@ -109,7 +125,7 @@ fn spawn_pulseaudio_input_thread(
     };
     assert!(spec.is_valid());
 
-    let record = simple_pulse::Simple::new(
+    let pulse_record = simple_pulse::Simple::new(
         None,              // Use the default server
         "denwa",           // Our application’s name
         Direction::Record, // We want a record stream
@@ -122,31 +138,24 @@ fn spawn_pulseaudio_input_thread(
     .unwrap_or_else(|e| panic!("pulseaudio error: {:?}", e.to_string()));
 
     spawn(move || {
-        || -> Result<()> {
-            let mut buf = vec![0i16; config.buf_size / 2];
-            let buf = {
-                let (p, buf, s) = unsafe { buf.align_to_mut::<u8>() };
-                assert!(p.is_empty() && s.is_empty());
-                assert!(buf.len() >= config.buf_size);
-                &mut buf[..config.buf_size]
-            };
-
+        || -> Result<(), Error> {
             let ch = match config.audio_ch {
                 1 => opus::Channels::Mono,
                 2 => opus::Channels::Stereo,
                 _ => panic!("unsupported channel"),
             };
             let mut opus = opus::Encoder::new(spec.rate, ch, opus::Application::Voip).unwrap();
+
+            let mut buf = vec![0i16; config.buf_size / 2];
             let mut encoded = vec![0; config.buf_size];
 
             loop {
-                record.read(buf).unwrap();
-                let (_, bufi16, _) = unsafe { buf.align_to_mut() };
-                let sz = opus.encode(bufi16, &mut encoded).unwrap();
+                pulse_record.read16(&mut buf).unwrap();
+                let sz = opus.encode(&buf, &mut encoded).unwrap();
                 let encoded = &encoded[..sz];
 
-                let mut key = key.lock().unwrap();
-                let enc_msg = key.encrypt(Message::Opus(encoded.to_vec()))?;
+                let msg = Message::Opus(encoded.to_vec());
+                let enc_msg = key.lock().unwrap().encrypt(msg)?;
                 send_to(enc_msg, &sock, peer_addr)?;
 
                 traffic.sent_bytes(encoded.len());
@@ -162,13 +171,11 @@ fn spawn_heartbeat_thread(
     peer_addr: SocketAddr,
 ) {
     spawn(move || {
-        || -> Result<()> {
+        || -> Result<(), Error> {
             loop {
-                {
-                    let mut key = key.lock().unwrap();
-                    let enc_msg = key.encrypt(Message::Heartbeat)?;
-                    send_to(enc_msg, &sock, peer_addr)?;
-                }
+                let msg = Message::Heartbeat;
+                let enc_msg = key.lock().unwrap().encrypt(msg)?;
+                send_to(enc_msg, &sock, peer_addr)?;
                 sleep(Duration::from_secs(5));
             }
         }()
@@ -182,7 +189,7 @@ fn voice_chat(
     peer_addr: SocketAddr,
     preshared_key: &[u8],
     config: Config,
-) -> Result<()> {
+) -> Result<(), Error> {
     let sock = Arc::new(sock);
 
     info!("config = {:?}", config);
@@ -217,7 +224,7 @@ fn voice_chat(
     );
     spawn_heartbeat_thread(sock.clone(), key.clone(), peer_addr);
 
-    let output = simple_pulse::Simple::new(
+    let pulse_output = simple_pulse::Simple::new(
         None,                // Use the default server
         "denwa",             // Our application’s name
         Direction::Playback, // We want a playback stream
@@ -235,13 +242,7 @@ fn voice_chat(
         _ => panic!("unsupported channel"),
     };
     let mut opus = opus::Decoder::new(spec.rate, ch).unwrap();
-    let mut decoded = vec![0i16; config.buf_size / 2];
-    let decoded = {
-        let (p, buf, s) = unsafe { decoded.align_to_mut::<u8>() };
-        assert!(p.is_empty() && s.is_empty());
-        assert!(buf.len() >= config.buf_size);
-        &mut buf[..config.buf_size]
-    };
+    let mut buf = vec![0i16; config.buf_size / 2];
 
     'process_message: loop {
         let (enc_msg, src) = match recv_from::<Sealed<Message>>(&sock) {
@@ -263,14 +264,11 @@ fn voice_chat(
         }
 
         // decrypt received message
-        let msg = {
-            let key = key.lock().unwrap();
-            match key.decrypt(enc_msg) {
-                Ok(msg) => msg,
-                Err(err) => {
-                    error!("invalid message: {}", err);
-                    continue 'process_message;
-                }
+        let msg = match key.lock().unwrap().decrypt(enc_msg) {
+            Ok(msg) => msg,
+            Err(err) => {
+                error!("invalid message: {}", err);
+                continue 'process_message;
             }
         };
 
@@ -280,11 +278,8 @@ fn voice_chat(
             }
             Message::Opus(data) => {
                 traffic.received_bytes(data.len());
-                let (_, decoded, _) = unsafe { decoded.align_to_mut::<i16>() };
-                let sz = opus.decode(&data, decoded, false).unwrap();
-                let (_, pcm, _) = unsafe { decoded[..sz].align_to_mut::<u8>() };
-
-                output.write(&pcm).unwrap();
+                let sz = opus.decode(&data, &mut buf, false).unwrap();
+                pulse_output.write16(&buf[..sz]).unwrap();
             }
             Message::Text(text) => {
                 println!("text message: {}", text);
@@ -307,7 +302,7 @@ fn random_psk(len: usize) -> Vec<u8> {
     key
 }
 
-fn start(matches: clap::ArgMatches) -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn start(matches: clap::ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
     use clap::value_t;
 
     let config = {

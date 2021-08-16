@@ -1,3 +1,4 @@
+mod pulse_ext;
 mod traffic_meter;
 
 use std::io::prelude::*;
@@ -5,7 +6,7 @@ use std::io::{stdin, stdout};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread::{sleep, spawn};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, error, info};
 use p2p_handshake::{
@@ -19,6 +20,7 @@ use pulse::{
     stream::Direction,
 };
 
+use pulse_ext::PulseSimpleExt as _;
 use traffic_meter::TrafficMeter;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -28,24 +30,9 @@ enum Message {
     Opus(Vec<u8>),
 }
 
-use pulse::error::PAErr;
-trait PulseSimpleExt {
-    fn read16(&self, buf: &mut [i16]) -> Result<(), PAErr>;
-    fn write16(&self, buf: &[i16]) -> Result<(), PAErr>;
-}
-impl PulseSimpleExt for simple_pulse::Simple {
-    fn read16(&self, buf: &mut [i16]) -> Result<(), PAErr> {
-        let (_, buf, _) = unsafe { buf.align_to_mut::<u8>() };
-        self.read(buf)
-    }
-    fn write16(&self, buf: &[i16]) -> Result<(), PAErr> {
-        let (_, buf, _) = unsafe { buf.align_to::<u8>() };
-        self.write(buf)
-    }
-}
-
 #[derive(Debug)]
 struct Config {
+    heartbeat_freq: Duration,
     channels: opus::Channels,
     sampling_rate: u32,
     frame_length: u32,
@@ -181,6 +168,7 @@ fn spawn_heartbeat_thread(
     sock: Arc<UdpSocket>,
     key: Arc<Mutex<SymmetricKey>>,
     peer_addr: SocketAddr,
+    config: Arc<Config>,
 ) {
     spawn(move || {
         || -> Result<(), Error> {
@@ -188,10 +176,23 @@ fn spawn_heartbeat_thread(
                 let msg = Message::Heartbeat;
                 let enc_msg = key.lock().unwrap().encrypt(msg)?;
                 send_to(enc_msg, &sock, peer_addr)?;
-                sleep(Duration::from_secs(5));
+                sleep(config.heartbeat_freq);
             }
         }()
         .unwrap_or_else(|e| error!("heartbeat thread panicked: {}", e))
+    });
+}
+
+fn spawn_watchdog_thread(config: Arc<Config>, last_hb_recved: Arc<Mutex<Option<Instant>>>) {
+    spawn(move || loop {
+        let last_hb_recved: Option<Instant> = *last_hb_recved.lock().unwrap();
+        if let Some(last) = last_hb_recved {
+            if last.elapsed() >= config.heartbeat_freq * 5 {
+                error!("Peer was dead.");
+                std::process::exit(1);
+            }
+        }
+        sleep(Duration::from_millis(500));
     });
 }
 
@@ -224,6 +225,7 @@ fn voice_chat(
     assert!(spec.is_valid());
 
     let traffic = Arc::new(TrafficMeter::new());
+    let last_hb_recved = Arc::new(Mutex::new(None));
 
     // spawn threads
     spawn_command_thread(sock.clone(), key.clone(), peer_addr, traffic.clone());
@@ -234,7 +236,8 @@ fn voice_chat(
         config.clone(),
         traffic.clone(),
     );
-    spawn_heartbeat_thread(sock.clone(), key.clone(), peer_addr);
+    spawn_heartbeat_thread(sock.clone(), key.clone(), peer_addr, config.clone());
+    spawn_watchdog_thread(config.clone(), last_hb_recved.clone());
 
     let pulse_output = simple_pulse::Simple::new(
         None,                // Use the default server
@@ -282,6 +285,8 @@ fn voice_chat(
         match msg {
             Message::Heartbeat => {
                 debug!("Heatbeat from {}", src);
+                let mut last_hb_recved = last_hb_recved.lock().unwrap();
+                *last_hb_recved = Some(Instant::now());
             }
             Message::Opus(data) => {
                 traffic.received_bytes(data.len());
@@ -313,18 +318,17 @@ fn start(matches: clap::ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
     use clap::value_t;
 
     let config = {
-        let audio_ch = matches.value_of("audio-ch").unwrap();
+        let audio_ch = matches.value_of("audio-ch").expect("default");
         let channels = match audio_ch {
             "mono" => opus::Channels::Mono,
             "stereo" => opus::Channels::Stereo,
             _ => unreachable!(),
         };
-        let audio_rate = value_t!(matches, "audio-rate", u32).unwrap();
-        let frame_length = value_t!(matches, "frame-length", u32).unwrap();
         Config {
+            heartbeat_freq: Duration::from_secs(1),
             channels,
-            sampling_rate: audio_rate,
-            frame_length,
+            sampling_rate: value_t!(matches, "audio-rate", u32).expect("default"),
+            frame_length: value_t!(matches, "frame-length", u32).expect("default"),
         }
     };
 
